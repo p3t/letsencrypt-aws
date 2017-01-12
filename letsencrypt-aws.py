@@ -20,7 +20,7 @@ import boto3
 import OpenSSL.crypto
 
 import rfc3986
-
+import elbapi
 
 DEFAULT_ACME_DIRECTORY_URL = "https://acme-v01.api.letsencrypt.org/directory"
 CERTIFICATE_EXPIRATION_THRESHOLD = datetime.timedelta(days=45)
@@ -44,22 +44,6 @@ class Logger(object):
         ))
         self._out.flush()
 
-
-def _get_iam_certificate(iam_client, certificate_id):
-    paginator = iam_client.get_paginator("list_server_certificates")
-    for page in paginator.paginate():
-        for server_certificate in page["ServerCertificateMetadataList"]:
-            if server_certificate["Arn"] == certificate_id:
-                cert_name = server_certificate["ServerCertificateName"]
-                response = iam_client.get_server_certificate(
-                    ServerCertificateName=cert_name,
-                )
-                return x509.load_pem_x509_certificate(
-                    response["ServerCertificate"]["CertificateBody"].encode(),
-                    default_backend(),
-                )
-
-
 class CertificateRequest(object):
     def __init__(self, cert_location, dns_challenge_completer, hosts,
                  key_type):
@@ -68,68 +52,6 @@ class CertificateRequest(object):
 
         self.hosts = hosts
         self.key_type = key_type
-
-
-class ELBCertificate(object):
-    def __init__(self, elb_client, iam_client, elb_name, elb_port):
-        self.elb_client = elb_client
-        self.iam_client = iam_client
-        self.elb_name = elb_name
-        self.elb_port = elb_port
-
-    def get_current_certificate(self):
-        response = self.elb_client.describe_load_balancers(
-            LoadBalancerNames=[self.elb_name]
-        )
-        [description] = response["LoadBalancerDescriptions"]
-        [elb_listener] = [
-            listener["Listener"]
-            for listener in description["ListenerDescriptions"]
-            if listener["Listener"]["LoadBalancerPort"] == self.elb_port
-        ]
-
-        if "SSLCertificateId" not in elb_listener:
-            raise ValueError(
-                "A certificate must already be configured for the ELB"
-            )
-
-        return _get_iam_certificate(
-            self.iam_client, elb_listener["SSLCertificateId"]
-        )
-
-    def update_certificate(self, logger, hosts, private_key, pem_certificate,
-                           pem_certificate_chain):
-        logger.emit(
-            "updating-elb.upload-iam-certificate", elb_name=self.elb_name
-        )
-
-        response = self.iam_client.upload_server_certificate(
-            ServerCertificateName=generate_certificate_name(
-                hosts,
-                x509.load_pem_x509_certificate(
-                    pem_certificate, default_backend()
-                )
-            ),
-            PrivateKey=private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ),
-            CertificateBody=pem_certificate.decode(),
-            CertificateChain=pem_certificate_chain.decode(),
-        )
-        new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
-
-        # Sleep before trying to set the certificate, it appears to sometimes
-        # fail without this.
-        time.sleep(15)
-        logger.emit("updating-elb.set-elb-certificate", elb_name=self.elb_name)
-        self.elb_client.set_load_balancer_listener_ssl_certificate(
-            LoadBalancerName=self.elb_name,
-            SSLCertificateId=new_cert_arn,
-            LoadBalancerPort=self.elb_port,
-        )
-
 
 class Route53ChallengeCompleter(object):
     def __init__(self, route53_client):
@@ -492,10 +414,16 @@ def update_certificates(persistent=False, force_issue=False):
     session = boto3.Session()
     s3_client = session.client("s3")
     elb_client = session.client("elb")
+    elbv2_client = session.client("elbv2")
     route53_client = session.client("route53")
     iam_client = session.client("iam")
 
-    config = json.loads(os.environ["LETSENCRYPT_AWS_CONFIG"])
+    json_str = os.environ["LETSENCRYPT_AWS_CONFIG"]
+    if (len(json_str) > 0): 
+        logger.emit("LETSENCRYPT_AWS_CONFIG", found="yes")
+    else: 
+        logger.emit("LETSENCRYPT_AWS_CONFIG", found="missing")
+    config = json.loads(json_str)
     domains = config["domains"]
     acme_directory_url = config.get(
         "acme_directory_url", DEFAULT_ACME_DIRECTORY_URL
@@ -507,10 +435,22 @@ def update_certificates(persistent=False, force_issue=False):
 
     certificate_requests = []
     for domain in domains:
+        logger.emit("checking config-domain ", mode="persistent", domain=domain)
         if "elb" in domain:
-            cert_location = ELBCertificate(
-                elb_client, iam_client,
-                domain["elb"]["name"], int(domain["elb"].get("port", 443))
+            cert_location = elbapi.ELBCertificate(
+                elb_client, 
+                iam_client,
+                domain["elb"]["name"], 
+                int(domain["elb"].get("port", 443)), 
+                logger
+            )
+        elif "elbv2" in domain:
+            cert_location = elbapi.ELBCertificateElbV2(
+                elbv2_client, 
+                iam_client,
+                domain["elbv2"]["name"], 
+                int(domain["elbv2"].get("port", 443)), 
+                logger
             )
         else:
             raise ValueError(
@@ -576,3 +516,4 @@ def register(email, out):
 
 if __name__ == "__main__":
     cli()
+
